@@ -1,0 +1,129 @@
+# Atlas · 上游自动同步
+#
+# 本仓库是上游项目的 Pages 镜像。定时任务把分支重置到上游最新提交,再把需要
+# 保留的本地文件(本工作流、Pages 构建工作流等)放回分支顶端,然后强推。
+# GitHub Pages 会随后自动重建站点。
+#
+# 仓库变量(全部可选):
+#   ATLAS_UPSTREAM_REPO    上游 owner/repo,默认取本仓库的 parent
+#   ATLAS_UPSTREAM_BRANCH  上游分支,默认取上游默认分支
+#   ATLAS_SYNC_BRANCH      被同步的目标分支,默认本仓库默认分支
+#   ATLAS_KEEP_PATHS       以空格分隔、需要在新提交里保留的本地路径
+#   ATLAS_SHALLOW          设为 1 时用浅克隆(适合超大仓库)
+name: Atlas · sync upstream
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 即使内容未变化也强制推送
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: atlas-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream and branch
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo="${{ vars.ATLAS_UPSTREAM_REPO }}"
+          branch="${{ vars.ATLAS_UPSTREAM_BRANCH }}"
+          target="${{ vars.ATLAS_SYNC_BRANCH }}"
+          if [ -z "$repo" ]; then
+            repo="$(gh api "repos/${{ github.repository }}" --jq '.parent.full_name // empty')"
+          fi
+          if [ -z "$repo" ]; then
+            echo "::error title=No upstream::本仓库没有 parent,请设置仓库变量 ATLAS_UPSTREAM_REPO。"
+            exit 1
+          fi
+          [ -n "$branch" ] || branch="$(gh api "repos/$repo" --jq '.default_branch')"
+          [ -n "$target" ] || target="$(gh api "repos/${{ github.repository }}" --jq '.default_branch')"
+          {
+            echo "repo=$repo"
+            echo "branch=$branch"
+            echo "target=$target"
+          } >> "$GITHUB_OUTPUT"
+          echo "upstream: $repo@$branch → $target"
+
+      - name: Checkout mirror branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.up.outputs.target }}
+          fetch-depth: 0
+
+      - name: Stash local files to keep
+        run: |
+          rm -rf "$RUNNER_TEMP/keep"
+          mkdir -p "$RUNNER_TEMP/keep"
+          for p in ${{ vars.ATLAS_KEEP_PATHS }} .github/workflows/atlas-sync.yml; do
+            [ -e "$p" ] || continue
+            mkdir -p "$RUNNER_TEMP/keep/$(dirname "$p")"
+            cp -a "$p" "$RUNNER_TEMP/keep/$p"
+            echo "keep: $p"
+          done
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${{ steps.up.outputs.repo }}.git"
+          if [ "${{ vars.ATLAS_SHALLOW }}" = "1" ]; then
+            git fetch --no-tags --depth=1 upstream "${{ steps.up.outputs.branch }}"
+          else
+            git fetch --no-tags upstream "${{ steps.up.outputs.branch }}"
+          fi
+
+      - name: Rebuild mirror commit
+        id: mirror
+        run: |
+          before="$(git rev-parse HEAD)"
+          git checkout -B atlas-mirror FETCH_HEAD
+          if [ -d "$RUNNER_TEMP/keep" ]; then
+            cp -a "$RUNNER_TEMP/keep/." .
+          fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git -c user.name="Atlas Sync" -c user.email="atlas-sync@users.noreply.github.com" \
+              commit -m "chore(sync): mirror ${{ steps.up.outputs.repo }}@${{ steps.up.outputs.branch }} ($(git rev-parse --short FETCH_HEAD))"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          after="$(git rev-parse HEAD)"
+          {
+            echo "before=$before"
+            echo "after=$after"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push mirror
+        if: steps.mirror.outputs.changed == 'true' || inputs.force
+        env:
+          TARGET: ${{ steps.up.outputs.target }}
+        run: |
+          git fetch --no-tags origin "$TARGET" || true
+          git push --force-with-lease="refs/heads/$TARGET:refs/remotes/origin/$TARGET" \
+            origin "atlas-mirror:refs/heads/$TARGET"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Atlas sync"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 | \`${{ steps.up.outputs.repo }}@${{ steps.up.outputs.branch }}\` |"
+            echo "| 分支 | \`${{ steps.up.outputs.target }}\` |"
+            echo "| 变化 | \`${{ steps.mirror.outputs.changed }}\` |"
+            echo "| 提交 | \`${{ steps.mirror.outputs.before }}\` → \`${{ steps.mirror.outputs.after }}\` |"
+            echo "| 保留 | \`${{ vars.ATLAS_KEEP_PATHS }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
